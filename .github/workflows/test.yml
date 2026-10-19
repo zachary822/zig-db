@@ -1,0 +1,65 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mariadb:
+    name: MariaDB ${{ matrix.mariadb }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # The LTS releases that MariaDB supports.
+        mariadb: ["10.11", "11.8", "12.3"]
+    services:
+      mariadb:
+        image: mariadb:${{ matrix.mariadb }}
+        env:
+          MARIADB_DATABASE: zig_test
+          MARIADB_USER: zig_test
+          MARIADB_PASSWORD: zig_test
+          MARIADB_RANDOM_ROOT_PASSWORD: "1"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: zachary822/setup-zig@v1
+        with:
+          version: 0.17.0
+      - name: Install MariaDB Connector/C
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libmariadb-dev pkg-config
+      - name: Test
+        env:
+          # The service container has no TLS certificate for 127.0.0.1.
+          TEST_DATABASE_URL: mariadb://zig_test:zig_test@127.0.0.1:3306/zig_test?tls=disabled
+        run: zig build test --summary all
+
+  # The stub must build without libmariadb.
+  disabled:
+    name: Without MariaDB
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: zachary822/setup-zig@v1
+        with:
+          version: 0.17.0
+      - name: Test
+        run: zig build test -Dmariadb=false --summary all
