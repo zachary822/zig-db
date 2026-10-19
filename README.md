@@ -99,6 +99,24 @@ give the result to `mariadb.Pool.create`.
 - `one(T, arena, sql, args)`: the first row, or null.
 - `begin`, `commit`, `rollback`: transactions. After a failed statement in
   a transaction, all statements fail until `rollback`.
+- `savepoint`, `rollbackTo`, `releaseSavepoint`: savepoints in a
+  transaction from `begin`. `rollbackTo` undoes only the changes after the
+  savepoint. After a failed statement, it also lets the transaction
+  continue. If the server undid the full transaction (for example after a
+  deadlock), `rollbackTo` fails, and only `rollback` is possible.
+
+```zig
+try conn.begin();
+errdefer conn.rollback();
+_ = try conn.exec(
+    \\INSERT INTO order (id) VALUES (?)
+, .{1});
+const sp = try conn.savepoint();
+if (conn.exec(
+    \\INSERT INTO audit (order_id) VALUES (?)
+, .{1})) |_| {} else |_| try conn.rollbackTo(sp); // keep the order
+try conn.commit();
+```
 - `execScript(sql)`: several statements without parameters. The pool must
   have `multi_statements = true`. Use it only for trusted SQL.
 

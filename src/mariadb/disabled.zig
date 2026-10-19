@@ -58,4 +58,16 @@ pub const Conn = struct {
     }
 
     pub fn rollback(_: *Conn) void {}
+
+    pub fn savepoint(_: *Conn) Error!common.Savepoint {
+        return error.DbNotConfigured;
+    }
+
+    pub fn rollbackTo(_: *Conn, _: common.Savepoint) Error!void {
+        return error.DbNotConfigured;
+    }
+
+    pub fn releaseSavepoint(_: *Conn, _: common.Savepoint) Error!void {
+        return error.DbNotConfigured;
+    }
 };

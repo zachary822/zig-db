@@ -1,7 +1,8 @@
 //! Database clients with connection pools. Each backend is a namespace with
 //! the same shape: `Pool` (`open` with a connection string, `acquire`,
 //! `destroy`) and `Conn` (`exec`, `query`, `one`, `begin`, `commit`,
-//! `rollback`, `release`). The backends:
+//! `rollback`, `savepoint`, `rollbackTo`, `releaseSavepoint`, `release`).
+//! The backends:
 //!
 //! - `mariadb`: MariaDB and MySQL, with MariaDB Connector/C.
 //!

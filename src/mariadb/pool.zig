@@ -20,6 +20,7 @@ const tracing = @import("../tracing.zig");
 const Allocator = std.mem.Allocator;
 const Error = common.Error;
 const ExecResult = common.ExecResult;
+const Savepoint = common.Savepoint;
 
 const log = std.log.scoped(.mariadb);
 
@@ -188,6 +189,11 @@ pub const Conn = struct {
     /// then run with autocommit. Thus, as in Django, all statements and
     /// `commit` fail until `rollback`.
     failed_in_transaction: bool = false,
+    /// Incremented by `begin`, so a `Savepoint` of an earlier transaction is
+    /// not valid.
+    transaction: u32 = 0,
+    /// The number of savepoints in the transaction from `begin`.
+    savepoint_depth: u32 = 0,
 
     /// Closes the connection and its prepared statements, and frees the
     /// statement cache. Only for `Pool.destroy`: the connection cannot be
@@ -327,7 +333,7 @@ pub const Conn = struct {
     /// other connections until `commit`. Call `commit` or `rollback` before
     /// `release`. MariaDB commits CREATE, ALTER and DROP immediately, also in
     /// a transaction. Transactions cannot be nested: MariaDB would commit the
-    /// open one.
+    /// open one. Use `savepoint` for a part of a transaction.
     pub fn begin(conn: *Conn) Error!void {
         if (conn.inTransaction()) {
             log.err("begin: a transaction is already open", .{});
@@ -347,6 +353,8 @@ pub const Conn = struct {
             if (c.mysql_real_query(conn.mysql.?, sql, sql.len) != 0) return conn.connError();
         }
         conn.in_transaction = true;
+        conn.transaction +%= 1;
+        conn.savepoint_depth = 0;
     }
 
     /// Makes the changes of the transaction permanent. If this returns an
@@ -369,6 +377,58 @@ pub const Conn = struct {
             log.err("rollback: {s} ({d}); closing the connection", .{ std.mem.span(c.mysql_error(mysql)), c.mysql_errno(mysql) });
             conn.disconnect();
         }
+    }
+
+    /// Marks the current point in the transaction from `begin`. Then
+    /// `rollbackTo` undoes only the changes after it, and the transaction
+    /// stays open. Savepoints can be nested.
+    pub fn savepoint(conn: *Conn) Error!Savepoint {
+        if (!conn.in_transaction) {
+            log.err("savepoint: no transaction from begin", .{});
+            return error.QueryFailed;
+        }
+        const depth = conn.savepoint_depth + 1;
+        try conn.savepointCommand(try conn.handle(), "SAVEPOINT", depth);
+        conn.savepoint_depth = depth;
+        return .{ .transaction = conn.transaction, .depth = depth };
+    }
+
+    /// Undoes the changes after `sp`, and removes the savepoints after it.
+    /// `sp` stays valid. After a failed statement in the transaction, this
+    /// lets the transaction continue. If the server undid the full
+    /// transaction (for example after a deadlock), the savepoint does not
+    /// exist on the server: then this returns `error.QueryFailed`, and
+    /// only `rollback` is possible.
+    pub fn rollbackTo(conn: *Conn, sp: Savepoint) Error!void {
+        try conn.checkSavepoint(sp);
+        // Not `handle`: it rejects all commands after a failed statement.
+        const mysql = conn.mysql orelse return error.DbUnavailable;
+        try conn.savepointCommand(mysql, "ROLLBACK TO SAVEPOINT", sp.depth);
+        conn.failed_in_transaction = false;
+        conn.savepoint_depth = sp.depth;
+    }
+
+    /// Removes `sp` and the savepoints after it. Their changes stay in the
+    /// transaction.
+    pub fn releaseSavepoint(conn: *Conn, sp: Savepoint) Error!void {
+        try conn.checkSavepoint(sp);
+        try conn.savepointCommand(try conn.handle(), "RELEASE SAVEPOINT", sp.depth);
+        conn.savepoint_depth = sp.depth - 1;
+    }
+
+    fn checkSavepoint(conn: *Conn, sp: Savepoint) Error!void {
+        if (!conn.in_transaction or sp.transaction != conn.transaction or sp.depth == 0 or sp.depth > conn.savepoint_depth) {
+            log.err("savepoint {d} is not in the current transaction", .{sp.depth});
+            return error.QueryFailed;
+        }
+    }
+
+    /// Sends `command` for the savepoint at `depth`. The name comes from the
+    /// depth, not from the caller, so it needs no escape.
+    fn savepointCommand(conn: *Conn, mysql: *c.MYSQL, comptime command: []const u8, depth: u32) Error!void {
+        var buf: [64]u8 = undefined;
+        const sql = std.fmt.bufPrint(&buf, command ++ " zig_db_sp{d}", .{depth}) catch unreachable;
+        if (c.mysql_real_query(mysql, sql.ptr, @intCast(sql.len)) != 0) return conn.connError();
     }
 
     /// A client span for the statement `sql`, named by its first word (the
@@ -806,6 +866,83 @@ test "transactions" {
     try std.testing.expectEqual(null, conn.mysql);
     conn.rollback();
     try std.testing.expectEqual(1, (try conn.one(Count, arena, one_sql, .{})).?.n);
+}
+
+// Needs a database, like the test above.
+test "savepoints" {
+    const gpa = std.testing.allocator;
+    const url = std.testing.environ.getAlloc(gpa, "TEST_DATABASE_URL") catch return error.SkipZigTest;
+    defer gpa.free(url);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try libraryInit();
+    defer libraryEnd();
+    const pool = try Pool.open(gpa, std.testing.io, url, .{
+        .pool_size = 1,
+        .acquire_timeout_ms = 1000,
+    });
+    defer pool.destroy();
+    const conn = try pool.acquire();
+    defer conn.release();
+
+    _ = try conn.exec(
+        \\CREATE TEMPORARY TABLE sp_test (n INT NOT NULL) ENGINE = InnoDB
+    , .{});
+    const Count = struct { n: i64 };
+    const count_sql =
+        \\SELECT COUNT(*) FROM sp_test
+    ;
+    const insert_sql =
+        \\INSERT INTO sp_test (n) VALUES (?)
+    ;
+
+    try conn.begin();
+    _ = try conn.exec(insert_sql, .{1});
+    const sp1 = try conn.savepoint();
+    _ = try conn.exec(insert_sql, .{2});
+    const sp2 = try conn.savepoint();
+    _ = try conn.exec(insert_sql, .{3});
+    try std.testing.expectEqual(2, sp2.depth);
+
+    try conn.rollbackTo(sp2);
+    try std.testing.expectEqual(2, (try conn.one(Count, arena, count_sql, .{})).?.n);
+    // The savepoint stays after `rollbackTo`.
+    _ = try conn.exec(insert_sql, .{3});
+    try conn.rollbackTo(sp2);
+    try std.testing.expectEqual(2, (try conn.one(Count, arena, count_sql, .{})).?.n);
+
+    // `rollbackTo` an earlier savepoint removes the later ones.
+    try conn.rollbackTo(sp1);
+    try std.testing.expectEqual(1, conn.savepoint_depth);
+    try std.testing.expectEqual(1, (try conn.one(Count, arena, count_sql, .{})).?.n);
+
+    // After a failed statement, `rollbackTo` lets the transaction continue.
+    // A real failed statement logs an error, which fails a test, so the
+    // test sets the flag.
+    _ = try conn.exec(insert_sql, .{4});
+    conn.failed_in_transaction = true;
+    try conn.rollbackTo(sp1);
+    try std.testing.expect(!conn.failed_in_transaction);
+    try std.testing.expectEqual(1, (try conn.one(Count, arena, count_sql, .{})).?.n);
+
+    // `releaseSavepoint` keeps the changes.
+    const sp3 = try conn.savepoint();
+    _ = try conn.exec(insert_sql, .{5});
+    try conn.releaseSavepoint(sp1);
+    try std.testing.expectEqual(0, conn.savepoint_depth);
+    _ = sp3;
+    try conn.commit();
+    try std.testing.expectEqual(2, (try conn.one(Count, arena, count_sql, .{})).?.n);
+
+    // A new transaction starts without savepoints.
+    try conn.begin();
+    try std.testing.expectEqual(0, conn.savepoint_depth);
+    const sp4 = try conn.savepoint();
+    try std.testing.expectEqual(1, sp4.depth);
+    try std.testing.expect(sp4.transaction != sp1.transaction);
+    conn.rollback();
 }
 
 // Needs a database, like the test above.

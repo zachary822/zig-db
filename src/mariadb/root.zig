@@ -28,6 +28,7 @@ pub const Tls = common.Tls;
 pub const Options = common.Options;
 pub const Error = common.Error;
 pub const ExecResult = common.ExecResult;
+pub const Savepoint = common.Savepoint;
 pub const Binary = common.Binary;
 pub const binary = common.binary;
 pub const UrlError = common.UrlError;

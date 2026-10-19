@@ -51,6 +51,18 @@ pub const Options = struct {
     multi_statements: bool = false,
 };
 
+/// A savepoint in the transaction from `Conn.begin`, from `Conn.savepoint`.
+/// It is valid until the transaction ends, until `Conn.rollbackTo` an
+/// earlier savepoint, or until `Conn.releaseSavepoint` of it or of an
+/// earlier savepoint.
+pub const Savepoint = struct {
+    /// The transaction of the savepoint, to find a savepoint of a
+    /// transaction that ended.
+    transaction: u32,
+    /// 1 for the first savepoint of the transaction, 2 for the next, ...
+    depth: u32,
+};
+
 pub const UrlError = std.Uri.ParseError || std.mem.Allocator.Error || error{
     UnsupportedScheme,
     MissingUser,
